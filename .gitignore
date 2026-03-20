@@ -1,0 +1,5 @@
+__pycache__/
+*.keras
+.env
+interview_history.db
+venv/
