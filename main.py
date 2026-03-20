@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # --- LANGKAH 4: LOAD MODEL AI ---
-emotion_model = tf.keras.models.load_model('interview_ai_model_v2.keras')
+emotion_model = tf.keras.models.load_model('models/interview_ai_model_v2.keras')
 emotions_list = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
 @app.get("/")
