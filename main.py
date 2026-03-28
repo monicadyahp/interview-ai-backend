@@ -10,9 +10,20 @@ from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI()
 
-# 1. DATABASE (Kriteria Fullstack - Sangat Bagus!)
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- 1. INISIALISASI ---
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+
+model_path = os.path.join("models", "interview_ai_model_v2.keras")
+emotion_model = tf.keras.models.load_model(model_path)
+emotions_list = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
+
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+
 def init_db():
     conn = sqlite3.connect('interview_history.db')
     c = conn.cursor()
@@ -23,43 +34,68 @@ def init_db():
 
 init_db()
 
-# 2. MIDDLEWARE
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# 3. LOAD MODEL (Kriteria AI - Pastikan path ke folder models)
-model_path = os.path.join("models", "interview_ai_model_v2.keras")
-emotion_model = tf.keras.models.load_model(model_path)
-emotions_list = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
-
-# 4. GENERATIVE AI (Kriteria AI)
-client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-
-@app.post("/predict") # Kriteria RESTful
+@app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    # --- PREPROCESSING ---
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-    img_resized = cv2.resize(img, (48, 48))
-    img_final = np.expand_dims(np.expand_dims(img_resized / 255.0, axis=-1), axis=0)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
-    # --- PREDIKSI ---
-    prediction = emotion_model.predict(img_final)
-    predicted_emotion = emotions_list[np.argmax(prediction)]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Deteksi Wajah dengan Padding
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    
+    if len(faces) > 0:
+        (x, y, w, h) = faces[0]
+        # Tambah margin 10% agar dahi/dagu tidak terpotong (membantu deteksi Happy/Surprise)
+        offset = int(w * 0.1)
+        y1, y2 = max(0, y-offset), min(gray.shape[0], y+h+offset)
+        x1, x2 = max(0, x-offset), min(gray.shape[1], x+w+offset)
+        face_roi = gray[y1:y2, x1:x2]
+    else:
+        face_roi = gray
+
+    # 2. Preprocessing: CLAHE (Lebih bagus dari equalizeHist untuk bayangan)
+    face_roi = clahe.apply(cv2.resize(face_roi, (48, 48)))
+
+    # 3. Normalisasi
+    img_final = face_roi.astype('float32') / 255.0
+    img_final = np.expand_dims(np.expand_dims(img_final, axis=-1), axis=0)
+    
+    # 4. Prediksi & Logic Thresholding
+    prediction = emotion_model.predict(img_final)[0]
+    
+    # --- LOGIC PENYARING SAD vs HAPPY ---
+    # Jika Happy > 25%, kita prioritaskan Happy karena Sad seringkali adalah "false positive"
+    happy_index = emotions_list.index('Happy')
+    sad_index = emotions_list.index('Sad')
+    
+    if prediction[happy_index] > 0.25:
+        predicted_emotion = "Happy"
+    else:
+        predicted_emotion = emotions_list[np.argmax(prediction)]
+    
     confidence_value = float(np.max(prediction))
 
-    # --- GEMINI + FALLBACK (Kriteria Robustness - Juara!) ---
+    # --- 5. Suggestion (Gemini/Fallback) ---
     ai_suggestion = ""
     try:
         prompt = f"Kandidat merasa {predicted_emotion}. Berikan 1 kalimat motivasi singkat."
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         ai_suggestion = response.text.strip()
-    except Exception:
-        # Fallback jika Gemini mati/limit (Agar aplikasi tidak Crash)
-        fallbacks = {"Happy": "Bagus! Pertahankan!", "Fear": "Tenang, kamu bisa!"}
+    except:
+        fallbacks = {
+            "Happy": "Bagus! Pertahankan senyum dan energi positifmu!", 
+            "Sad": "Ayo lebih semangat! Tunjukkan antusiasmemu sedikit lagi.",
+            "Neutral": "Tetap tenang dan fokus, jawabanmu terdengar profesional.",
+            "Fear": "Tarik napas dalam, kamu sudah mempersiapkan ini dengan baik.",
+            "Angry": "Coba lebih rileks, tunjukkan sisi ramahmu kepada interviewer.",
+            "Disgust": "Alihkan fokus ke hal positif, kamu punya kendali penuh atas dirimu.",
+            "Surprise": "Jangan biarkan kejutan mengganggu fokusmu, tetap tenang!"
+        }
         ai_suggestion = fallbacks.get(predicted_emotion, "Tetap semangat!")
 
-    # --- SIMPAN DB ---
+    # --- 6. Simpan DB ---
     conn = sqlite3.connect('interview_history.db')
     c = conn.cursor()
     c.execute("INSERT INTO history VALUES (?, ?, ?)", 
